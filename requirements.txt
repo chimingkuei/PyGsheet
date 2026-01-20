@@ -1,0 +1,4 @@
+schedule
+gspread
+google-auth
+openpyxl
