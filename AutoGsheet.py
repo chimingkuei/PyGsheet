@@ -1,7 +1,7 @@
 import gspread
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import schedule
 from openpyxl import Workbook, load_workbook
 from __init__ import __version__
@@ -53,7 +53,8 @@ def get_daily_workbook():
         wb = Workbook()
         ws = wb.active
         ws.title = "Summary"
-        ws.append(["日期", "組別", "成員", "起始列", "結束列", "每日總和"])
+        # 新增 J 欄
+        ws.append(["日期", "組別", "成員", "起始列", "結束列", "午餐每日總和", "飲料每日總和"])
         wb.save(file_path)
     return wb, ws, file_path
 
@@ -61,10 +62,11 @@ def get_daily_workbook():
 # 判斷月底（測試用）
 # =====================
 def is_month_end():
+    # 真實環境可用下面註解：
     # today = datetime.now()
     # tomorrow = today + timedelta(days=1)
     # return tomorrow.month != today.month and today.weekday() < 5
-    return True 
+    return True  # 測試用：每次都算月底
 
 # =====================
 # 月底彙總（依 GROUP 排序）
@@ -79,7 +81,7 @@ def generate_monthly_summary():
     ws_month.title = "Monthly Summary"
 
     # 標題
-    ws_month.append(["組別", "成員", "月累計總和"])
+    ws_month.append(["組別", "成員", "午餐月累計", "飲料月累計"])
 
     # key = (member, group_no)
     cumulative = {}
@@ -90,20 +92,39 @@ def generate_monthly_summary():
         ws = wb.active
 
         for row in ws.iter_rows(min_row=2, values_only=True):
-            # [日期, 組別, 成員, 起始列, 結束列, 每日總和]
-            _, group_no, member, _, _, daily_total = row
+            # [日期, 組別, 成員, 起始列, 結束列, E每日總和, J每日總和]
+            _, group_no, member, _, _, daily_e, daily_j = row
             key = (member, group_no)
-            cumulative[key] = cumulative.get(key, 0) + (daily_total or 0)
+            if key not in cumulative:
+                cumulative[key] = {"E": 0, "J": 0}
+            cumulative[key]["E"] += daily_e or 0
+            cumulative[key]["J"] += daily_j or 0
 
     # ⭐ 依 GROUP 排序（主），成員排序（次）
-    for (member, group_no), month_total in sorted(
+    for (member, group_no), totals in sorted(
         cumulative.items(),
         key=lambda x: (x[0][1], x[0][0])  # (group_no, member)
     ):
-        ws_month.append([group_no, member, month_total])
+        ws_month.append([group_no, member, totals["E"], totals["J"]])
 
     wb_month.save(monthly_file)
     logger.info(f"月底彙總完成（依 GROUP 排序）：{monthly_file.name}")
+
+# =====================
+# 取得今日 Sheet 名稱 (例如 01.20(二))
+# =====================
+def get_today_gsheet_sheet(gc, share_link):
+    sh = gc.open_by_url(share_link)
+    today_str = datetime.now().strftime("%m.%d")  # 例如 "01.20"
+    # 模糊匹配 sheet 名稱
+    sheet_name = None
+    for name in sh.worksheets():
+        if today_str in name.title:
+            sheet_name = name
+            break
+    if sheet_name is None:
+        raise ValueError(f"找不到今天的 Sheet ({today_str})")
+    return sheet_name
 
 # =====================
 # 主工作
@@ -114,11 +135,12 @@ def job():
         logger.info("今天是週六 / 週日，job 不執行")
         return
 
-    logger.info("18:00 job 開始")
+    logger.info("job 開始")
     try:
         share_link = "https://docs.google.com/spreadsheets/d/1k2yjKUA4m886_Vj24V_jnpt4ClTkQIjoabBBQKb4Jko/edit"
         gc = gspread.service_account(filename="token.json")
-        worksheet = gc.open_by_url(share_link).sheet1
+
+        worksheet = get_today_gsheet_sheet(gc, share_link)
 
         START_ROW = 5
         GROUP_SIZE = 4
@@ -126,15 +148,28 @@ def job():
         TOTAL_COUNT = GROUP_SIZE * GROUP_COUNT
 
         # E 欄
-        raw_values = worksheet.col_values(5)[START_ROW - 1 : START_ROW - 1 + TOTAL_COUNT]
-        numbers = []
-        for v in raw_values:
+        raw_e = worksheet.col_values(5)[START_ROW - 1 : START_ROW - 1 + TOTAL_COUNT]
+        numbers_e = []
+        for v in raw_e:
             try:
-                numbers.append(float(v))
+                numbers_e.append(float(v))
             except:
-                numbers.append(0)
-        while len(numbers) < TOTAL_COUNT:
-            numbers.append(0)
+                numbers_e.append(0)
+
+        # J 欄
+        raw_j = worksheet.col_values(10)[START_ROW - 1 : START_ROW - 1 + TOTAL_COUNT]
+        numbers_j = []
+        for v in raw_j:
+            try:
+                numbers_j.append(float(v))
+            except:
+                numbers_j.append(0)
+
+        # 補齊長度
+        while len(numbers_e) < TOTAL_COUNT:
+            numbers_e.append(0)
+        while len(numbers_j) < TOTAL_COUNT:
+            numbers_j.append(0)
 
         # B 欄成員
         member_values = worksheet.col_values(2)
@@ -144,8 +179,12 @@ def job():
 
         for group_index in range(GROUP_COUNT):
             start_idx = group_index * GROUP_SIZE
-            group = numbers[start_idx : start_idx + GROUP_SIZE]
-            group_sum = sum(group)
+
+            group_e = numbers_e[start_idx : start_idx + GROUP_SIZE]
+            group_j = numbers_j[start_idx : start_idx + GROUP_SIZE]
+
+            group_sum_e = sum(group_e)
+            group_sum_j = sum(group_j)
 
             start_row = START_ROW + start_idx
             end_row = start_row + GROUP_SIZE - 1
@@ -161,12 +200,14 @@ def job():
                 member_name,
                 start_row,
                 end_row,
-                group_sum
+                group_sum_e,
+                group_sum_j
             ])
 
             logger.info(
                 f"第 {group_index+1:02d} 組 | 成員={member_name} | "
-                f"E{start_row}~E{end_row} | 總和={group_sum}"
+                f"E{start_row}~E{end_row}={group_sum_e} | "
+                f"J{start_row}~J{end_row}={group_sum_j}"
             )
 
         wb.save(file_path)
@@ -177,15 +218,15 @@ def job():
             logger.info("模擬月底，開始生成月結")
             generate_monthly_summary()
 
-        logger.info("18:00 job 結束")
+        logger.info("job 結束")
 
     except Exception:
-        logger.exception("18:00 job 發生錯誤")
+        logger.exception("job 發生錯誤")
 
 # =====================
 # schedule
 # =====================
-schedule.every().day.at("18:00").do(job)
+schedule.every().day.at("11:29").do(job)
 
 # =====================
 # 主迴圈
